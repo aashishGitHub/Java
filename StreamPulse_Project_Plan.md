@@ -1,6 +1,22 @@
 
 # StreamPulse — Real-time Telemetry Event Hub in Java (Interview Portfolio Project)
 
+> ## ▶ Picking this back up? Read `~/Documents/GitHub/streampulse/RESUME-HERE.md` first.
+>
+> **Last worked: 2026-09-29.** That file has the current state, and it is not obvious from
+> the code alone:
+>
+> - **Phases 0, 1 and most of 2 are built and verified** — ingest on Kinesis (moto, free),
+>   JWT auth, per-tenant Redis quotas, graceful drain, circuit breaker + timeout + retry.
+>   139 tests, 0 failures at commit `7229585`.
+> - **Two branches are unmerged and unverified** — gRPC (BS-09) and Keycloak OIDC + health
+>   probes. Both compile; neither has been reviewed or seen to pass its integration tests.
+> - **The main checkout is not on `main`**, and the retry commit landed on a feature branch.
+>   `RESUME-HERE.md` §1 explains why and gives the one-line fix.
+> - **Phase 3 needs a design decision first:** the plan below specifies Kafka Streams, but the
+>   pivot to Kinesis (ADR-0008) leaves no direct equivalent. Options are Flink, a Lambda
+>   consumer, or KCL — all of which must still run free and locally.
+
 ## Context
 
 **Why:** Aashish is preparing for backend-focused Senior Engineer rounds on a real-time telemetry "Event Hub" team (prep doc: "Disney Event Hub — Interview Prep"). The JD asks for Java 17+/Spring Boot, message-based distributed systems (Kafka/Kinesis), SQL + NoSQL (Postgres, DynamoDB), a React/TypeScript frontend, Terraform/Docker/K8s, Datadog/Grafana observability, and AI tooling (Claude Code, MCP, agentic workflows). Known interview content: BFS (Rotting Oranges), LRU Cache, system design of a real-time telemetry system and a Twitter-like feed, and Spring MVC questions.
@@ -43,13 +59,12 @@ Video players on many apps/devices emit telemetry: `session_start`, `heartbeat`,
 | `services/ingest-gateway` | Spring MVC + **virtual threads** | `POST /v1/events:batch` | Validation, idempotency keys, Kafka idempotent producer, partition key choice, 429 + Retry-After backpressure, Bucket4j/Redis rate limit, Resilience4j, OAuth2 resource server (JWT) |
 | `services/stream-processor` | **Kafka Streams** | windowed aggregates | Topology, state stores, `exactly_once_v2`, grace/late events, suppression, repartitioning, `TopologyTestDriver` |
 | `services/sink-writer` | **Spring Kafka** consumers | Redis, DynamoDB, S3, Postgres writes | Batch listeners, manual acks, `@RetryableTopic` + DLT, idempotent consumer, consumer lag, rebalancing |
-| `services/query-api` | **Spring WebFlux** | REST + **SSE** + feed | Reactive vs blocking, backpressure (`onBackpressureLatest`/sample), heartbeats, `Last-Event-ID` resume, hand-written LRU cache, reactive Redis |
+| `services/query-api` | **Spring WebFlux** | REST + **SSE** + feed | Reactive vs blocking, backpressure (`onBackpressureLatest`/sample), heartbeats, `Last-Event-ID` resume, Caffeine caching, reactive Redis |
 | `services/control-plane` | Spring MVC + **JPA/Postgres** | tenants, titles, alert rules, alert engine | Flyway, N+1 demo/fix, `@Transactional` propagation/self-invocation gotcha, HikariCP sizing, outbox → **Debezium CDC**, BFS suppression, topo-sort cycle detection |
 | `services/mcp-server` (small) | Spring AI MCP server | read-only tools over query-api | AI tooling/agentic story (verify Spring AI MCP starter name/version in current docs) |
 | `web/` | React 19 + TS + Vite | live dashboard + admin | SSE hook with reconnect/backoff, generated TS client from OpenAPI, Vitest + Playwright |
 | `libs/contracts` | Avro + OpenAPI codegen | shared schemas | Schema evolution, compatibility modes |
 | `libs/platform` | shared starter (your own **auto-configuration**) | tracing, error model (RFC 7807 ProblemDetail), idempotency, JSON, test fixtures | Shows *how* Spring auto-config works (`@AutoConfiguration`, `@Conditional*`, `AutoConfiguration.imports`) |
-| `kata/` | plain Java + JUnit 5 | LRU, LFU, BFS/DFS set | Coding round, with a tie-back to production code |
 | `tools/load-gen` | Gatling (Java DSL) | steady + "live match spike" | Perf/JVM phase |
 
 ### Data flow (happy path)
@@ -132,7 +147,9 @@ Each phase is independently demoable. The **Interview proof** line is what you'l
 - `docker-compose.yml` with profiles, `Makefile` (`up-core`, `up-full`, `test`, `it`, `demo-*`).
 - GitHub Actions: build, unit, integration tests (Testcontainers on the GH runner).
 - Spec templates, ADR-001 (multi-module monolith-repo), ADR-002 (Gradle), ADR-003 (local AWS strategy).
-- **Kata track starts here (runs in parallel all along):** `kata/` with LRU (HashMap + doubly linked list), thread-safe LRU variant, LFU, Rotting Oranges (multi-source BFS), Number of Islands, Word Ladder, Course Schedule (topo sort), Clone Graph. Parameterized JUnit tests plus a README with complexity notes.
+- **Domain primitives:** `TenantId` and `EventId` in `libs/platform` — validated value objects used by every later phase. Teaches records, compact constructors, boundary validation and `equals`/`hashCode` correctness on material the project actually uses.
+
+> **Scope note (decided 2026-09-28):** algorithm/DSA practice is **out of scope** for StreamPulse. This project is for learning the Java ecosystem in a cloud environment. Coding-round preparation lives in `interview-qa/17-coding-lru-and-graphs.md`.
 - **Interview proof:** clean build, CI green, "why multi-module" ADR.
 
 ### Phase 1 — Contracts & schemas
@@ -167,10 +184,10 @@ Each phase is independently demoable. The **Interview proof** line is what you'l
 
 ### Phase 5 — Query API + real-time SSE
 - WebFlux: `GET /v1/metrics/{tenant}/{metric}?from&to` (Redis first, then DynamoDB) and `GET /v1/stream/metrics` as **SSE**. Kafka listener → `Sinks.Many` multicast per tenant, `onBackpressureLatest`, 15s heartbeat, `Last-Event-ID` resume from a Redis ring buffer.
-- The hand-written **LRU cache** from `kata/` is promoted into a thread-safe title-metadata cache, invalidated by `config.changes.v1`. Compare against Caffeine in an ADR.
+- A thread-safe title-metadata cache invalidated by `config.changes.v1`. ADR compares a hand-rolled LRU against **Caffeine** — the interesting content is the eviction-policy and sizing trade-off, not the data structure.
 - **Benchmark ADR:** the same endpoint on MVC + virtual threads vs WebFlux, under Gatling, with the numbers recorded.
 - **Tests:** `@WebFluxTest`, `StepVerifier`, SSE integration test, contract test with `web/`.
-- **Interview proof:** "WebFlux vs MVC, and when each fits" answered with your own data, plus LRU as a design decision.
+- **Interview proof:** "WebFlux vs MVC, and when each fits" answered with your own data, plus cache eviction policy and sizing as a design decision.
 
 ### Phase 6 — Control plane, CDC & alert engine
 - JPA entities: Tenant, App, Title, AlertRule, ServiceNode/Dependency. Flyway migrations. HikariCP tuning notes.
@@ -246,7 +263,6 @@ Each phase is independently demoable. The **Interview proof** line is what you'l
 | Datadog/Grafana, tracing, "system health" metrics | 8 |
 | AI tooling (Claude Code, MCP, agentic) | §3 spec workflow, 13 |
 | RabbitMQ, gRPC, strangler-fig, SLA error budgets | see §5a |
-| BFS / LRU coding | Kata (0→), 5 (LRU), 6 (BFS/topo) |
 | System design: telemetry pipeline | whole project + 14 |
 | System design: Twitter-like feed | 12 |
 | JUnit/Mockito/Testcontainers | every phase |
@@ -258,7 +274,7 @@ Each phase is independently demoable. The **Interview proof** line is what you'l
 | Gap | Where it lands | What gets built |
 |---|---|---|
 | Spring core: bean lifecycle, scopes, profiles | Phase 0 + `libs/platform` | `spring-internals-lab` test module: `@PostConstruct`/`@PreDestroy`, `SmartLifecycle` (used for real to start/stop Kafka listeners in order on graceful shutdown), a custom `BeanPostProcessor`, request vs prototype vs singleton scope tests, `@Profile` + `application-{local,aws,k8s,datadog}.yml`, `@ConfigurationProperties` with validation. Includes a doc explaining constructor vs field injection. |
-| Concurrency primitives | Phase 2, 5, 9 + kata | Explicit `ThreadPoolExecutor` (core/max/queue/rejection policy) for S3 upload offload, compared with virtual-thread executor. `ReentrantReadWriteLock` in the LRU cache. `AtomicLong`/`LongAdder` counters. `CountDownLatch`/`CyclicBarrier` in concurrency tests. `CompletableFuture` fan-out (`allOf`, `thenCompose`, `exceptionally`, `orTimeout`) in query-api for aggregating Redis+DynamoDB. Kata: bounded producer/consumer two ways, plus a deliberate deadlock detected via thread dump. |
+| Concurrency primitives | Phase 2, 5, 9 | Explicit `ThreadPoolExecutor` (core/max/queue/rejection policy) for S3 upload offload, compared with virtual-thread executor. `ReentrantReadWriteLock` in the title-metadata cache. `AtomicLong`/`LongAdder` counters. `CountDownLatch`/`CyclicBarrier` in concurrency tests. `CompletableFuture` fan-out (`allOf`, `thenCompose`, `exceptionally`, `orTimeout`) in query-api for aggregating Redis+DynamoDB. Plus a bounded producer/consumer implemented two ways, and a deliberate deadlock detected via thread dump. |
 | Kafka tuning with numbers | Phase 9 | `docs/kafka-tuning.md` experiment matrix: producer `linger.ms`/`batch.size`/`compression.type` and consumer `fetch.min.bytes`/`max.poll.records`/listener concurrency, measured as throughput, p99 and bytes on disk/network. Gives a real "direction of the number" story in Java. |
 | Resilience4j: all four, states and configs | Phase 2 + 9 | Replace Bucket4j with **Resilience4j RateLimiter** (keep Bucket4j+Redis only for distributed per-tenant quotas, and explain why: R4j is per-instance). Add **Retry** with exponential backoff + jitter on DynamoDB/S3 calls. Add **Bulkhead** (semaphore vs thread-pool). Tests drive CB through CLOSED→OPEN→HALF_OPEN→CLOSED and assert events/metrics. `docs/resilience.md` maps each pattern to the failure mode it guards against. |
 | JPA vs raw JDBC; Mongo/MySQL | Phase 6 | Same query implemented with JPA and with `JdbcClient` (verify API exists in your Spring version; it's in Spring 6.1+ as far as I know), benchmarked. Hot read path uses JDBC. ADR covers Postgres vs MySQL (MVCC, JSONB) and Mongo vs DynamoDB. Optional `mongo` profile storing alert history in MongoDB to show Spring Data portability. |
@@ -320,7 +336,7 @@ Each phase is independently demoable. The **Interview proof** line is what you'l
 ### BS-02 · "Title Command Center" page & archive offload
 **Skills:** `CompletableFuture` composition, `ThreadPoolExecutor` tuning, virtual threads vs pools, locks, atomics, latches, deadlock diagnosis.
 
-**Context:** The operations team wants one page per title during a live event showing live viewers (Redis), the 24h trend (DynamoDB), title metadata (control-plane via LRU), active alerts, and top error codes. Calling these one after another takes ~600ms (target breach). Separately, S3 uploads in sink-writer block Kafka listener threads, which causes consumer lag and rebalances.
+**Context:** The operations team wants one page per title during a live event showing live viewers (Redis), the 24h trend (DynamoDB), title metadata (control-plane, via Caffeine), active alerts, and top error codes. Calling these one after another takes ~600ms (target breach). Separately, S3 uploads in sink-writer block Kafka listener threads, which causes consumer lag and rebalances.
 
 **Actors:** live-ops operator, query-api, sink-writer.
 
@@ -332,7 +348,7 @@ Each phase is independently demoable. The **Interview proof** line is what you'l
 **Functional requirements**
 - **REQ-CC-01** WHEN `GET /v1/titles/{id}/command-center` is called THE SYSTEM SHALL fetch the 5 panels **in parallel** (`CompletableFuture.supplyAsync` on a named executor) and combine them with `allOf` / `thenCombine`.
 - **REQ-CC-02** WHEN any panel exceeds its budget (`orTimeout`, per-panel config, default 150ms) THE SYSTEM SHALL return the page with that panel marked `status: "DEGRADED"` (`exceptionally`/`completeOnTimeout`) and increment `commandcenter.panel.degraded{panel}`.
-- **REQ-CC-03** Metadata SHALL come from the hand-written LRU (capacity configurable) guarded by a `ReentrantReadWriteLock`. The LRU access order is mutated on a read, so the design doc explains why a read still needs the write lock (or why a segmented/approximate design is chosen instead). This is a deliberate discussion point.
+- **REQ-CC-03** Metadata SHALL come from a **Caffeine** cache (size- and time-bounded, configurable), invalidated by `config.changes.v1`. The ADR covers why a library beats a hand-rolled cache here — Caffeine's W-TinyLFU admission policy, its non-blocking reads, and the fact that a naive LRU mutates access order on a *read*, so a `ReadWriteLock` around one would need the **write** lock on every get. That last point is the discussion worth having out loud.
 - **REQ-CC-04** sink-writer SHALL hand S3 uploads to a **bounded `ThreadPoolExecutor`** (core=4, max=16, `ArrayBlockingQueue(200)`, named threads, `CallerRunsPolicy`). WHEN the queue is full, the caller (listener) thread runs the upload itself, which naturally slows consumption (backpressure) instead of dropping or OOMing.
 - **REQ-CC-05** An alternate implementation using `Executors.newVirtualThreadPerTaskExecutor()` + `Semaphore(16)` SHALL exist behind a property. Phase 9 compares the two, and the ADR explains why an unbounded virtual-thread executor still needs a semaphore (downstream protection).
 - **REQ-CC-06** Per-tenant ingest counters SHALL use `LongAdder` in a `ConcurrentHashMap<TenantId, LongAdder>` (`computeIfAbsent`) and be exported as Micrometer gauges. A JMH micro-benchmark compares `AtomicLong`, `LongAdder` and `synchronized` under contention.
@@ -341,12 +357,12 @@ Each phase is independently demoable. The **Interview proof** line is what you'l
 
 **NFRs:** Command Center p95 < 250ms with one panel artificially slowed to 2s. Kafka consumer lag stays < 10k with S3 latency injected at 1s (Toxiproxy).
 
-**Data flow:** browser → query-api → {Redis, DynamoDB, LRU→control-plane, alerts (Redis), top-errors (Redis ZSET)} in parallel → merged DTO → JSON.
+**Data flow:** browser → query-api → {Redis, DynamoDB, cache→control-plane, alerts (Redis), top-errors (Redis ZSET)} in parallel → merged DTO → JSON.
 
 **Interview questions answered:** `thenApply` vs `thenCompose`; which pool `supplyAsync` uses by default and why that's dangerous; `ThreadPoolExecutor` sizing and rejection policies; `LongAdder` vs `AtomicLong`; deadlock conditions and prevention; virtual threads vs pools.
 
 **Acceptance tests:** `CommandCenterTimeoutTest` (stubbed slow panel); `S3OffloadBackpressureIT`; `QuotaTransferDeadlockTest` (v1 times out, v2 passes 10k crossed transfers); `LruConcurrencyStressTest`; JMH report.
-**Phase:** 4, 5, 9 + kata.
+**Phase:** 4, 5, 9.
 
 ---
 
