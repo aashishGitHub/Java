@@ -3,19 +3,22 @@
 
 > ## ▶ Picking this back up? Read `~/Documents/GitHub/streampulse/RESUME-HERE.md` first.
 >
-> **Last worked: 2026-09-29.** That file has the current state, and it is not obvious from
-> the code alone:
+> **Last worked: 2026-09-29. Phases 0, 1 and 2 are complete and merged.**
 >
-> - **Phases 0, 1 and most of 2 are built and verified** — ingest on Kinesis (moto, free),
->   JWT auth, per-tenant Redis quotas, graceful drain, circuit breaker + timeout + retry.
->   139 tests, 0 failures at commit `7229585`.
-> - **Two branches are unmerged and unverified** — gRPC (BS-09) and Keycloak OIDC + health
->   probes. Both compile; neither has been reviewed or seen to pass its integration tests.
-> - **The main checkout is not on `main`**, and the retry commit landed on a feature branch.
->   `RESUME-HERE.md` §1 explains why and gives the one-line fix.
-> - **Phase 3 needs a design decision first:** the plan below specifies Kafka Streams, but the
->   pivot to Kinesis (ADR-0008) leaves no direct equivalent. Options are Flink, a Lambda
->   consumer, or KCL — all of which must still run free and locally.
+> `main` is clean — one branch, no worktrees, `./gradlew clean build` green with
+> **149 tests, 0 failures**, including Testcontainers integration tests against moto
+> (Kinesis), Redis and Keycloak.
+>
+> The ingest gateway accepts batched telemetry over **REST and gRPC** through one use case
+> (proven by a parity test that decodes the Avro off Kinesis and compares every field), behind
+> Keycloak OIDC with real JWKS/issuer/audience validation, per-tenant Redis quotas, semaphore
+> backpressure, atomic idempotency, `Retry( CircuitBreaker( TimeLimiter( publish ) ) )`, and an
+> ordered graceful drain.
+>
+> **The next session opens with a decision, not code.** Phase 3 below specifies Kafka Streams,
+> but the pivot to Kinesis (ADR-0008) leaves no direct equivalent. `RESUME-HERE.md` §3 lays out
+> the four options against the one constraint that matters here — it has to run free and
+> locally, with no AWS account.
 
 ## Context
 
